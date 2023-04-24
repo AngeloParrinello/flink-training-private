@@ -26,6 +26,7 @@ import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.api.functions.source.SourceFunction;
 import org.apache.flink.training.exercises.common.datatypes.TaxiRide;
 import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator;
+import org.apache.flink.training.exercises.common.utils.GeoUtils;
 import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
 
 /**
@@ -36,12 +37,13 @@ import org.apache.flink.training.exercises.common.utils.MissingSolutionException
  */
 public class RideCleansingExercise {
 
+    // TaxiRide a POJO for a taxi ride schema
+    // Both source and sink (DBs or other) contains TaxiRide objects
     private final SourceFunction<TaxiRide> source;
     private final SinkFunction<TaxiRide> sink;
 
     /** Creates a job using the source and sink provided. */
     public RideCleansingExercise(SourceFunction<TaxiRide> source, SinkFunction<TaxiRide> sink) {
-
         this.source = source;
         this.sink = sink;
     }
@@ -52,9 +54,11 @@ public class RideCleansingExercise {
      * @throws Exception which occurs during job execution.
      */
     public static void main(String[] args) throws Exception {
+        // create the job with sources and sink
         RideCleansingExercise job =
                 new RideCleansingExercise(new TaxiRideGenerator(), new PrintSinkFunction<>());
 
+        // start the execution with a specific method
         job.execute();
     }
 
@@ -80,7 +84,8 @@ public class RideCleansingExercise {
     public static class NYCFilter implements FilterFunction<TaxiRide> {
         @Override
         public boolean filter(TaxiRide taxiRide) throws Exception {
-            throw new MissingSolutionException();
+           return GeoUtils.isInNYC(taxiRide.startLon, taxiRide.startLat) &&
+                   GeoUtils.isInNYC(taxiRide.endLon, taxiRide.endLat);
         }
     }
 }
