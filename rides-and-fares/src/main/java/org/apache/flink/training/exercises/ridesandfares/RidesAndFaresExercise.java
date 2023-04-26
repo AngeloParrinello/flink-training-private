@@ -19,6 +19,8 @@
 package org.apache.flink.training.exercises.ridesandfares;
 
 import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -31,7 +33,6 @@ import org.apache.flink.training.exercises.common.datatypes.TaxiFare;
 import org.apache.flink.training.exercises.common.datatypes.TaxiRide;
 import org.apache.flink.training.exercises.common.sources.TaxiFareGenerator;
 import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator;
-import org.apache.flink.training.exercises.common.utils.MissingSolutionException;
 import org.apache.flink.util.Collector;
 
 /**
@@ -68,13 +69,24 @@ public class RidesAndFaresExercise {
 
         // A stream of taxi ride START events, keyed by rideId.
         DataStream<TaxiRide> rides =
-                env.addSource(rideSource).filter(ride -> ride.isStart).keyBy(ride -> ride.rideId);
+                env
+                        .addSource(rideSource)
+                        .filter(ride -> ride.isStart)
+                        .keyBy(ride -> ride.rideId);
 
         // A stream of taxi fare events, also keyed by rideId.
-        DataStream<TaxiFare> fares = env.addSource(fareSource).keyBy(fare -> fare.rideId);
+        DataStream<TaxiFare> fares =
+                env
+                        .addSource(fareSource)
+                        .keyBy(fare -> fare.rideId);
 
         // Create the pipeline.
-        rides.connect(fares).flatMap(new EnrichmentFunction()).addSink(sink);
+        rides
+                .connect(fares)
+                .flatMap(new EnrichmentFunction())
+                .uid("enrichment operator")
+                .name("enrichment operator")
+                .addSink(sink);
 
         // Execute the pipeline and return the result.
         return env.execute("Join Rides with Fares");
@@ -93,25 +105,63 @@ public class RidesAndFaresExercise {
                         new TaxiFareGenerator(),
                         new PrintSinkFunction<>());
 
+        // Setting up checkpointing so that the state can be explored with the State Processor API.
+        // Generally it's better to separate configuration settings from the code,
+        // but for this example it's convenient to have it here for running in the IDE.
+        Configuration conf = new Configuration();
+        conf.setString("state.backend", "filesystem");
+        conf.setString("state.checkpoints.dir", "file:///tmp/checkpoints");
+        conf.setString("execution.checkpointing.interval", "10s");
+        conf.setString(
+                "execution.checkpointing.externalized-checkpoint-retention",
+                "RETAIN_ON_CANCELLATION");
+
         job.execute();
     }
 
     public static class EnrichmentFunction
             extends RichCoFlatMapFunction<TaxiRide, TaxiFare, RideAndFare> {
+        // this is the state which we want to save in the local system.
+        // IMPORTANT: clear the state once we finished to use it. Remember: Flink
+        // creates it at runtime.
+        // we could split the value state into two separated state: one for the ride and one for the value
+        private ValueState<RideAndFare> rideAndFareValueState;
 
         @Override
         public void open(Configuration config) throws Exception {
-            throw new MissingSolutionException();
+            // everytime the stream has to get the real value during runtime, it will use the open method
+            // in this way we can retrieve the real value of a specific key-value pair state
+            rideAndFareValueState = getRuntimeContext()
+                    .getState(new ValueStateDescriptor<RideAndFare>("rideAndFareValueState", RideAndFare.class));
         }
 
         @Override
         public void flatMap1(TaxiRide ride, Collector<RideAndFare> out) throws Exception {
-            throw new MissingSolutionException();
+            // if we have only the ride, we update the state linked to the startID
+            // BUT we don't push it into the output stream
+            // we keep it into the storage
+            if (rideAndFareValueState.value() == null) {
+                RideAndFare updatedRideAndFare = new RideAndFare(ride, null);
+                rideAndFareValueState.update(updatedRideAndFare);
+            } else {
+                // if the state is completed, we push the object to the output stream and then we clean the store
+                // mapped to that specific key
+                RideAndFare updateRideAndFare = new RideAndFare(ride, rideAndFareValueState.value().fare);
+                out.collect(updateRideAndFare);
+                rideAndFareValueState.clear();
+            }
         }
 
         @Override
         public void flatMap2(TaxiFare fare, Collector<RideAndFare> out) throws Exception {
-            throw new MissingSolutionException();
+            if (rideAndFareValueState.value() == null) {
+                RideAndFare updatedRideAndFare = new RideAndFare(null, fare);
+                rideAndFareValueState.update(updatedRideAndFare);
+            } else {
+                RideAndFare updateRideAndFare = new RideAndFare(rideAndFareValueState.value().ride, fare);
+                out.collect(updateRideAndFare);
+                rideAndFareValueState.clear();
+            }
         }
     }
 }
