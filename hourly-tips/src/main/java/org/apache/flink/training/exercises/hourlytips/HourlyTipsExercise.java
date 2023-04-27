@@ -90,16 +90,27 @@ public class HourlyTipsExercise {
         // start the data generator
         DataStream<TaxiFare> fares = env.addSource(source);
 
+        // I have to create a strategy, in order to mark each event with a specififc timestamp.
+        // How can Flink split each event without a specific timestamp on which to base?
+        // Note that I could have use a different strategy (such as the monotone, as in the examples)
         WatermarkStrategy<TaxiFare> strategy = WatermarkStrategy
                 .<TaxiFare>forBoundedOutOfOrderness(Duration.ofSeconds(20))
                 .withTimestampAssigner((event, timestamp) -> event.startTime.toEpochMilli());
 
-        // replace this with your solution
+        // I'll split the datastream into two sub-datastream for more clarity.The first one
+        // create a stream of data with the total tips for each driver in a time-window of 1 hour
         DataStream<Tuple3<Long, Long, Float>> maxForEveryDriver =
                 fares
+                    // this line is very important! Otherwise Flink would not know which watermarks and timestamps using
                     .assignTimestampsAndWatermarks(strategy)
+                    // keyed stream, for parallelism
                     .keyBy(x -> x.driverId)
+                    // one hour window, the most basic one
                     .window(TumblingEventTimeWindows.of(Time.hours(1)))
+                    // I would have use a lambda, one-line like solution
+                    // Here I'm saying how to process each data
+                    // REMEMBER THAT SPLITS EACH DATA BASED ON ITS DRIVER ID
+                    // So, I don't need the valuestate ... however, Flink allows us to use it also in this situation
                     .process(new ProcessWindowFunction<TaxiFare, Tuple3<Long, Long, Float>, Long, TimeWindow>() {
                         @Override
                         public void process(Long driverId,
