@@ -21,7 +21,14 @@ package org.apache.flink.training.exercises.longrides;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.java.tuple.Tuple;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.TimerService;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
@@ -69,9 +76,9 @@ public class LongRidesExercise {
 
         // the WatermarkStrategy specifies how to extract timestamps and generate watermarks
         WatermarkStrategy<TaxiRide> watermarkStrategy =
-                WatermarkStrategy.<TaxiRide>forBoundedOutOfOrderness(Duration.ofSeconds(60))
-                        .withTimestampAssigner(
-                                (ride, streamRecordTimestamp) -> ride.getEventTimeMillis());
+                WatermarkStrategy
+                        .<TaxiRide>forBoundedOutOfOrderness(Duration.ofSeconds(60))
+                        .withTimestampAssigner((ride, streamRecordTimestamp) -> ride.getEventTimeMillis());
 
         // create the pipeline
         rides.assignTimestampsAndWatermarks(watermarkStrategy)
@@ -95,20 +102,95 @@ public class LongRidesExercise {
         job.execute();
     }
 
+    // Long = type of key
+    // TaxiRide = type of input
+    // Long = type of output
     @VisibleForTesting
     public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
+        private transient MapState<Long, Long> rideIdTimeStamp;
+        private static long MAX_DURATION = Duration.ofHours(2).toMillis();
 
+        // Called once during initialization.
         @Override
         public void open(Configuration config) throws Exception {
-            throw new MissingSolutionException();
+            MapStateDescriptor<Long, Long> pendingRide =
+                    new MapStateDescriptor<>("pendingRide", Long.class, Long.class);
+
+            rideIdTimeStamp = getRuntimeContext().getMapState(pendingRide);
+        }
+
+        // Called as each ride arrives to be processed.
+        @Override
+        public void processElement(TaxiRide ride, Context context, Collector<Long> out) throws Exception {
+
+            long rideId = ride.rideId;
+            long eventTime = ride.getEventTimeMillis();
+            TimerService timerService = context.timerService();
+
+            if (eventTime <= timerService.currentWatermark()) {
+
+            } else {
+                System.out.println("EVENTTIME: " + eventTime + "WATERMARK  " + timerService.currentWatermark());
+                if (ride.isStart) {
+                    System.out.println("The id for the start event is: " + rideId);
+                    if (rideIdTimeStamp.get(rideId) != null) {
+                        System.out.println("The id is: " + rideId + "and it's already in the map");
+                        // retrieve rideID already present, end already arrived
+                        if ((rideIdTimeStamp.get(rideId) - eventTime) >= MAX_DURATION) {
+                            System.out.println("The id is: " + rideId + " and has passed more than two hours");
+                            // it's more than two hours
+                            out.collect(rideId);
+                        }
+                        System.out.println("The id is: " + rideId + " and I'm deleting it");
+                        // in both case, I'll remove the entry
+                        System.out.println("The rideStamp contains the key: " + rideIdTimeStamp.contains(rideId));
+                        rideIdTimeStamp.remove(rideId);
+                        System.out.println("The rideStamp contains the key: " + rideIdTimeStamp.contains(rideId));
+                        System.out.println("The rideStamp is: " + rideIdTimeStamp.isEmpty());
+                    } else {
+                        System.out.println("The start event has arrived before the end: " + rideId);
+                        // the start event is arrived before the end event
+                        System.out.println("The start event has arrived before the end and rideStamp contains the key: " + rideIdTimeStamp.contains(rideId));
+                        rideIdTimeStamp.put(rideId, eventTime);
+                        System.out.println("The start event has arrived before the end and rideStamp contains the key: " + rideIdTimeStamp.contains(rideId));
+                        // schedule a callback for when 2 hours have passed
+                        timerService.registerEventTimeTimer(MAX_DURATION);
+                    }
+                } else {
+                    System.out.println("The id for the end event is: " + rideId);
+                    // if the event arrives and it's already present the start event, I'll check if are passed two hours
+                    if (rideIdTimeStamp.get(rideId) != null) {
+                        System.out.println("The id is: " + rideId + " and it's already in the map");
+                        // retrieve rideID already present
+                        if ((eventTime - rideIdTimeStamp.get(rideId)) >= MAX_DURATION) {
+                            System.out.println("The id is: " + rideId + "and has passed more than two hours");
+                            // it's more than two hours
+                            out.collect(rideId);
+                        }
+                        System.out.println("The id is: " + rideId + " and I'm deleting it");
+                        // in both case, I'll remove the entry
+                        System.out.println("The rideStamp contains the key: " + rideIdTimeStamp.contains(rideId));
+                        rideIdTimeStamp.remove(rideId);
+                        System.out.println("The rideStamp contains the key: " + rideIdTimeStamp.contains(rideId));
+                        System.out.println("The rideStamp is: " + rideIdTimeStamp.isEmpty());
+                    } else {
+                        // if it's a ride end event, I'll put it in my map
+                        // and I'll wait for the start event
+                        System.out.println("The rideStamp does not contains the key: " + rideIdTimeStamp.contains(rideId));
+                        rideIdTimeStamp.put(rideId, eventTime);
+                        System.out.println("The rideStamp contains the key now: " + rideIdTimeStamp.contains(rideId));
+                    }
+                }
+            }
         }
 
         @Override
-        public void processElement(TaxiRide ride, Context context, Collector<Long> out)
-                throws Exception {}
+        public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out) throws Exception{
+            // after two hours, I'll forward the warning
+            long rideId = context.getCurrentKey();
 
-        @Override
-        public void onTimer(long timestamp, OnTimerContext context, Collector<Long> out)
-                throws Exception {}
+            rideIdTimeStamp.remove(rideId);
+            out.collect(rideId);
+        }
     }
 }

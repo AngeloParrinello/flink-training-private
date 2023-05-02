@@ -36,6 +36,38 @@ import org.apache.flink.util.Collector;
 
 import java.time.Duration;
 
+/*
+
+These cases are worth noting:
+
+* _The START event is missing_. Then END event will sit in state indefinitely (this is a leak!).
+* _The END event is missing_. The timer will fire and the state will be cleared (this is ok).
+* _The END event arrives after the timer has fired and cleared the state._ In this case the END
+event will be stored in state indefinitely (this is another leak!).
+
+These leaks could be addressed by either
+using [state TTL](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/fault-tolerance/state/#state-time-to-live-ttl),
+or another timer, to eventually clear any lingering state.
+
+Regardless of how clever we are with what state we keep, and how long we choose to keep it,
+we should eventually clear it -- because otherwise our state will grow in an unbounded fashion.
+And having lost that information, we will run the risk of late events causing incorrect or duplicated results.
+
+This tradeoff between keeping state indefinitely versus occasionally getting things wrong when events are
+ late is a challenge that is inherent to stateful stream processing.
+
+### If you want to go further
+
+For each of these, add tests to check for the desired behavior.
+
+* Extend the solution so that it never leaks state.
+* Define what it means for an event to be missing, detect missing START and END events,
+and send some notification of this to a side output.
+
+ */
+
+
+
 /**
  * Java solution for the "Long Ride Alerts" exercise.
  *
@@ -72,11 +104,19 @@ public class LongRidesSolution {
 
         // the WatermarkStrategy specifies how to extract timestamps and generate watermarks
         WatermarkStrategy<TaxiRide> watermarkStrategy =
+                // We've adopted this strategy because the stream is out of order
+                // Why do we choose 60 seconds as duration? Because it's a trade-off
+                // We might choose more time but the latency will increase
+                // vice-versa if we choose less time, the completeness of our analytics
+                // will decrease
                 WatermarkStrategy.<TaxiRide>forBoundedOutOfOrderness(Duration.ofSeconds(60))
                         .withTimestampAssigner(
                                 (ride, streamRecordTimestamp) -> ride.getEventTimeMillis());
 
         // create the pipeline
+        // Basically, the watermarks allows to generate the windowing
+        // BUT in Flink, you must create a watermark for each event if you want to use
+        // the timer as in this case
         rides.assignTimestampsAndWatermarks(watermarkStrategy)
                 .keyBy(ride -> ride.rideId)
                 .process(new AlertFunction())
@@ -101,6 +141,9 @@ public class LongRidesSolution {
     @VisibleForTesting
     public static class AlertFunction extends KeyedProcessFunction<Long, TaxiRide, Long> {
 
+        // we could use both valuestate or mapstate
+        // Rule-of-thumb: KISS, so use ValueState as much as possible
+        // and REMEMBER, we have a value state for each key!
         private ValueState<TaxiRide> rideState;
 
         @Override
@@ -116,24 +159,34 @@ public class LongRidesSolution {
 
             TaxiRide firstRideEvent = rideState.value();
 
+            // At the first event for that specific key, the value state will be null
             if (firstRideEvent == null) {
                 // whatever event comes first, remember it
                 rideState.update(ride);
 
+                // if it's a start event we'll start the timer
                 if (ride.isStart) {
                     // we will use this timer to check for rides that have gone on too long and may
                     // not yet have an END event (or the END event could be missing)
+                    // also in this case we have a timer for each key (notice the context object)
                     context.timerService().registerEventTimeTimer(getTimerTime(ride));
                 }
             } else {
+                // if the value state is not null, means that one event has already arrived
+                // and we have to check whether is a start event or end event
                 if (ride.isStart) {
+                    // check if the ride was too long
                     if (rideTooLong(ride, firstRideEvent)) {
+                        // if it was too long, send the rideId to the output stream
                         out.collect(ride.rideId);
                     }
                 } else {
-                    // the first ride was a START event, so there is a timer unless it has fired
+                    // we receive the end event, so the first event was a start event
+                    // since the first ride was a START event, it could be a timer unless it has fired
                     context.timerService().deleteEventTimeTimer(getTimerTime(firstRideEvent));
 
+                    // this is a tricky situation, due to the parallel-way-of-work by Flink
+                    // remember what did Ricci say during his course on Parallel and Distributed Programming?
                     // perhaps the ride has gone on too long, but the timer didn't fire yet
                     if (rideTooLong(firstRideEvent, ride)) {
                         out.collect(ride.rideId);
@@ -166,6 +219,10 @@ public class LongRidesSolution {
 
         private long getTimerTime(TaxiRide ride) throws RuntimeException {
             if (ride.isStart) {
+                // NOTICE that the timer start from the event time of the event
+                // and after two hours will be fire the timer, with the help of
+                // onTimer function
+                // also in this case we have a timer for each key
                 return ride.eventTime.plusSeconds(120 * 60).toEpochMilli();
             } else {
                 throw new RuntimeException("Can not get start time from END event.");
